@@ -2,16 +2,9 @@ name: win-vps
 
 on:
   workflow_dispatch:
-    inputs:
-      minutes:
-        description: "最长在线分钟数 (上限 350)"
-        required: true
-        default: "350"
-        type: string
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: win-vps
@@ -32,78 +25,77 @@ jobs:
           Get-PSDrive C | Select-Object Used,Free | Format-List
           Write-Output "runner=${{ runner.name }} os=${{ runner.os }} arch=${{ runner.arch }}"
 
-      - name: 起网页终端并回写地址
+      - name: 装 tmate 抓地址并保活
         shell: pwsh
-        continue-on-error: true
+        timeout-minutes: 350
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Continue'
-          $log = "$env:TEMP\sshx.out"
-          $err = "$env:TEMP\sshx.err"
-          Remove-Item $log,$err -ErrorAction SilentlyContinue
+          $msys = 'C:\msys64'
+          $bash = Join-Path $msys 'usr\bin\bash.exe'
+          $pac  = Join-Path $msys 'usr\bin\pacman.exe'
+          $log  = Join-Path $msys 'tmp\tmate.log'
 
-          Start-Process -FilePath "bash" `
-            -ArgumentList '-lc','curl -sSf https://sshx.io/get | sh -s run' `
-            -RedirectStandardOutput $log -RedirectStandardError $err -NoNewWindow
+          Write-Output '--- 安装 tmate ---'
+          & $pac -Sy --noconfirm --needed tmate 2>&1 | Select-Object -Last 6
 
-          $url = $null
-          for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Seconds 5
-            $txt = ''
-            if (Test-Path $log) { $txt += (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
-            if (Test-Path $err) { $txt += (Get-Content $err -Raw -ErrorAction SilentlyContinue) }
-            $m = [regex]::Match($txt, 'https://sshx\.io/s/[A-Za-z0-9]+')
-            if ($m.Success) { $url = $m.Value; break }
+          Remove-Item $log -ErrorAction SilentlyContinue
+          Write-Output '--- 启动 tmate ---'
+          $arg = '"tmate -F > /tmp/tmate.log 2>&1"'
+          Start-Process -FilePath $bash -ArgumentList '-lc', $arg -NoNewWindow
+
+          $sshUrl = $null
+          $webUrl = $null
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            if (-not (Test-Path $log)) { continue }
+            $t = Get-Content $log -Raw -ErrorAction SilentlyContinue
+            if (-not $t) { continue }
+            $m1 = [regex]::Match($t, 'ssh\s+([A-Za-z0-9]+@[A-Za-z0-9.\-]*tmate[A-Za-z0-9.\-]*)')
+            $m2 = [regex]::Match($t, 'https?://tmate\.io/t/[A-Za-z0-9]+')
+            if ($m1.Success) { $sshUrl = $m1.Groups[1].Value }
+            if ($m2.Success) { $webUrl = $m2.Value }
+            if ($sshUrl) { break }
           }
 
-          $info = New-Object System.Collections.ArrayList
-          [void]$info.Add('# Windows 白嫖机')
-          [void]$info.Add('')
-          [void]$info.Add('## 机器')
-          [void]$info.Add('')
-          [void]$info.Add('- OS: ')
-          [void]$info.Add('```')
-          [void]$info.Add((Get-CimInstance Win32_OperatingSystem).Caption)
-          [void]$info.Add('```')
-          [void]$info.Add('')
-          if ($url) {
-            [void]$info.Add('## 网页终端 (浏览器直接打开)')
-            [void]$info.Add('')
-            [void]$info.Add('```')
-            [void]$info.Add($url)
-            [void]$info.Add('```')
-          } else {
-            [void]$info.Add('## sshx 没起来')
-            [void]$info.Add('')
-            [void]$info.Add('看 tmate 步骤日志')
-            if (Test-Path $err) {
-              [void]$info.Add('```')
-              [void]$info.Add((Get-Content $err -Raw -ErrorAction SilentlyContinue))
-              [void]$info.Add('```')
-            }
-          }
-          [void]$info.Add('')
-          [void]$info.Add('更新时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC')
-          $body = $info -join "`n"
-          Write-Output $body
+          Write-Output '--- tmate 输出 ---'
+          Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { Write-Output $_ }
+          Write-Output '--- 解析结果 ---'
+          Write-Output "SSH=$sshUrl"
+          Write-Output "WEB=$webUrl"
 
-          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/status.md"
-          $h = @{ Authorization = "token $env:GITHUB_TOKEN"; "User-Agent" = "gh-actions"; Accept = "application/vnd.github+json" }
+          if ($sshUrl) { Write-Output "::notice title=SSH::$sshUrl" }
+          if ($webUrl) { Write-Output "::notice title=Web::$webUrl" }
+
+          $lines = @(
+            '# Windows 白嫖机',
+            '',
+            '- SSH: ' + $sshUrl,
+            '- Web: ' + $webUrl,
+            '- OS: ' + (Get-CimInstance Win32_OperatingSystem).Caption,
+            '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+          )
+          $body = $lines -join "`n"
+
+          $api = 'https://api.github.com/repos/' + $env:GITHUB_REPOSITORY + '/contents/status.md'
+          $h = @{ Authorization = 'token ' + $env:GH_TOKEN; 'User-Agent' = 'gh-actions'; Accept = 'application/vnd.github+json' }
           $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
           try {
             $ex = Invoke-RestMethod -Uri $api -Headers $h -ErrorAction Stop
-            $payload = @{ message = "ci: 更新连接信息"; content = $b64; sha = $ex.sha; branch = "main" } | ConvertTo-Json -Compress
+            $payload = @{ message = 'ci: 连接信息'; content = $b64; sha = $ex.sha; branch = 'main' } | ConvertTo-Json -Compress
           } catch {
-            $payload = @{ message = "ci: 更新连接信息"; content = $b64; branch = "main" } | ConvertTo-Json -Compress
+            $payload = @{ message = 'ci: 连接信息'; content = $b64; branch = 'main' } | ConvertTo-Json -Compress
           }
           try {
-            Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $payload -ContentType "application/json; charset=utf-8" | Out-Null
-            Write-Output "status.md 已回写"
+            Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $payload -ContentType 'application/json; charset=utf-8' | Out-Null
+            Write-Output 'status.md 已回写'
           } catch {
-            Write-Output "回写失败: $_"
+            Write-Output ('回写失败: ' + $_)
           }
 
-      - name: tmate 命令行 (SSH)
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 350
-        with:
-          limit-access-to-actor: false
+          Write-Output '--- 会话保持中，最长 350 分钟 ---'
+          while ($true) {
+            Start-Sleep -Seconds 120
+            Write-Output ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss'))
+          }
