@@ -17,47 +17,79 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 机器信息
-        shell: pwsh
-        run: |
-          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | Format-List
-          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List
-
-      - name: 开 RDP + bore 隧道（自动重连）
+      - name: 开 RDP + 设密码并实测 + bore 隧道
         shell: pwsh
         timeout-minutes: 350
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Continue'
-          $pw = 'GitHub@2024!vps'
+          Add-Type -AssemblyName System.DirectoryServices.AccountManagement
 
-          Write-Host '=== 1. 账户与远程桌面 ==='
-          net user runneradmin $pw 2>&1 | Out-String | Write-Host
+          function Test-Pw([string]$user, [string]$pass) {
+            try {
+              $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine')
+              return $ctx.ValidateCredentials($user, $pass)
+            } catch { return $false }
+          }
+
+          Write-Host '=== 1. 账户信息（设置前）==='
+          $before = Get-LocalUser -Name 'runneradmin' -ErrorAction SilentlyContinue
+          if ($before) { Write-Host ('Enabled=' + $before.Enabled + ' PwExpires=' + $before.PasswordExpires + ' LastSet=' + $before.PasswordLastSet) }
+          else { Write-Host 'runneradmin 不存在！'; Get-LocalUser | ForEach-Object { Write-Host ('  本地账户: ' + $_.Name) } }
+
+          Write-Host '=== 2. 设置密码（多候选，逐个实测）==='
+          $cands = @('Runner2024', 'Runner2024!', 'Gh2024vps')
+          $pw = $null
+          foreach ($c in $cands) {
+            try {
+              $sec = ConvertTo-SecureString $c -AsPlainText -Force
+              Set-LocalUser -Name 'runneradmin' -Password $sec -ErrorAction Stop
+              Start-Sleep -Seconds 2
+              if (Test-Pw 'runneradmin' $c) { $pw = $c; Write-Host ('  ✅ 可用密码: ' + $c); break }
+              else { Write-Host ('  ⚠️ 设了 ' + $c + ' 但验证不过') }
+            } catch { Write-Host ('  ❌ ' + $c + ' 设置失败: ' + $_) }
+          }
+          if (-not $pw) { Write-Host '所有候选密码都失败！' }
+
+          Write-Host '=== 3. 启用账户 / 不过期 / 加组 ==='
+          Enable-LocalUser -Name 'runneradmin' -ErrorAction SilentlyContinue
+          Set-LocalUser -Name 'runneradmin' -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'runneradmin' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member 'runneradmin' -ErrorAction SilentlyContinue
+          $after = Get-LocalUser -Name 'runneradmin'
+          Write-Host ('Enabled=' + $after.Enabled + ' PwExpires=' + $after.PasswordExpires)
+
+          Write-Host '=== 4. 开远程桌面 ==='
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
           Set-Service -Name TermService -StartupType Automatic
           Start-Service TermService -ErrorAction SilentlyContinue
-          Write-Host ('TermService = ' + (Get-Service TermService).Status)
+          $ts = (Get-Service TermService).Status
+          Write-Host ('TermService = ' + $ts)
+          $hostname = $env:COMPUTERNAME
+          Write-Host ('主机名 = ' + $hostname)
 
-          Write-Host '=== 2. 下载 bore ==='
+          Write-Host '=== 5. 下载 bore ==='
           $dir = Join-Path $env:TEMP 'bore'
           $zip = Join-Path $env:TEMP 'bore.zip'
           Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-pc-windows-msvc.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 180
           Expand-Archive -Path $zip -DestinationPath $dir -Force
           $boreExe = (Get-ChildItem -Path $dir -Recurse -Filter 'bore.exe' | Select-Object -First 1).FullName
           Write-Host ('bore.exe = ' + $boreExe)
-          if (-not $boreExe) { throw 'bore.exe 没找到' }
 
           function Push-Status([string]$addr) {
             $lines = @(
               '# Windows 白嫖机',
               '',
               '- RDP 地址: ' + $addr,
-              '- 用户名: .\runneradmin',
+              '- 用户名: ' + $hostname + '\runneradmin',
+              '- 用户名(简写): .\runneradmin',
               '- 密码: ' + $pw,
+              '- 密码是否实测通过: ' + $(if ($pw) { '是' } else { '否' }),
               '- 系统: Windows Server 2025 Datacenter',
+              '- RDP 服务: ' + $ts,
               '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
             )
             $body = $lines -join "`n"
@@ -72,10 +104,8 @@ jobs:
             }
             try {
               Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $p -ContentType 'application/json; charset=utf-8' | Out-Null
-              Write-Host ('status.md <- ' + $addr)
-            } catch {
-              Write-Host ('回写失败: ' + $_)
-            }
+              Write-Host ('status.md <- ' + $addr + ' / ' + $pw)
+            } catch { Write-Host ('回写失败: ' + $_) }
           }
 
           function Start-Bore {
@@ -84,40 +114,33 @@ jobs:
             $e = Join-Path $env:TEMP 'bore.err'
             Remove-Item $o,$e -ErrorAction SilentlyContinue
             Start-Process -FilePath $boreExe -ArgumentList 'local','3389','--to','bore.pub' -RedirectStandardOutput $o -RedirectStandardError $e -NoNewWindow
-            $addr = ''
+            $a = ''
             for ($i = 0; $i -lt 20; $i++) {
               Start-Sleep -Seconds 3
               $t = [string](Get-Content $o -Raw -ErrorAction SilentlyContinue) + [string](Get-Content $e -Raw -ErrorAction SilentlyContinue)
               $m = [regex]::Match($t, 'listening at bore\.pub:(\d+)')
-              if ($m.Success) { $addr = 'bore.pub:' + $m.Groups[1].Value; break }
+              if ($m.Success) { $a = 'bore.pub:' + $m.Groups[1].Value; break }
             }
-            if (-not $addr) {
-              Write-Host ('bore 原始输出: ' + [string](Get-Content $e -Raw -ErrorAction SilentlyContinue))
-            }
-            Write-Host ('Start-Bore 结果 = ' + $addr)
-            return $addr
+            if (-not $a) { Write-Host ('bore 输出: ' + [string](Get-Content $e -Raw -ErrorAction SilentlyContinue)) }
+            return $a
           }
 
-          Write-Host '=== 3. 建立隧道 ==='
+          Write-Host '=== 6. 建立隧道 ==='
           $addr = (Start-Bore | Select-Object -Last 1)
           $last = $addr
+          Write-Host ('隧道地址 = ' + $addr)
           if ($addr) {
             Push-Status $addr
-            Write-Output ('::notice title=RDP::mstsc /v:' + $addr)
+            Write-Output ('::notice title=RDP::mstsc /v:' + $addr + '  密码=' + $pw)
           }
 
-          Write-Host '=== 4. 保活 + 断线重连 ==='
+          Write-Host '=== 7. 保活 + 重连 ==='
           while ($true) {
             Start-Sleep -Seconds 60
-            $proc = Get-Process bore -ErrorAction SilentlyContinue
-            if (-not $proc) {
-              Write-Host 'bore 进程消失，重连中...'
+            if (-not (Get-Process bore -ErrorAction SilentlyContinue)) {
+              Write-Host 'bore 掉了，重连'
               $addr = (Start-Bore | Select-Object -Last 1)
-              if ($addr -and $addr -ne $last) {
-                $last = $addr
-                Push-Status $addr
-                Write-Output ('::notice title=RDP::mstsc /v:' + $addr)
-              }
+              if ($addr -and $addr -ne $last) { $last = $addr; Push-Status $addr }
             }
-            Write-Host ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss') + '  addr=' + $last)
+            Write-Host ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss') + ' ' + $last)
           }
