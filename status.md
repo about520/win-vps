@@ -1,11 +1,18 @@
 # Windows 白嫖机
 
 - RDP 地址: 
-bore.pub:35134
-- 用户名: .\runneradmin
+bore.pub:10285
+- 用户名: 
+runnervmm7ud1
+\runneradmin
+- 用户名(简写): .\runneradmin
 - 密码: 
-GitHub@2024!vps
+Runner2024
+- 密码是否实测通过: 
+是
 - 系统: Windows Server 2025 Datacenter
+- RDP 服务: 
+Running
 - 时间: 
-2026-11-20 09:34:06
+2026-11-20 09:37:22
  UTC
