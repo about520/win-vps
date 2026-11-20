@@ -23,57 +23,63 @@ jobs:
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | Format-List
           Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List
           Get-PSDrive C | Select-Object Used,Free | Format-List
-          Write-Output "runner=${{ runner.name }} os=${{ runner.os }} arch=${{ runner.arch }}"
 
-      - name: 装 tmate 抓地址并保活
+      - name: 开 RDP + 双隧道并回写地址
         shell: pwsh
         timeout-minutes: 350
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Continue'
-          $msys = 'C:\msys64'
-          $bash = Join-Path $msys 'usr\bin\bash.exe'
-          $pac  = Join-Path $msys 'usr\bin\pacman.exe'
-          $log  = Join-Path $msys 'tmp\tmate.log'
+          $pw = 'GitHub@2024!vps'
 
-          Write-Output '--- 安装 tmate ---'
-          & $pac -Sy --noconfirm --needed tmate 2>&1 | Select-Object -Last 6
+          Write-Output '=== 1. 设置账户与远程桌面 ==='
+          net user runneradmin $pw 2>&1 | Out-String | Write-Output
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
+          Get-Service TermService | Select-Object Name,Status | Format-List
 
-          Remove-Item $log -ErrorAction SilentlyContinue
-          Write-Output '--- 启动 tmate ---'
-          $arg = '"tmate -F > /tmp/tmate.log 2>&1"'
-          Start-Process -FilePath $bash -ArgumentList '-lc', $arg -NoNewWindow
+          Write-Output '=== 2. bore 隧道 ==='
+          $boreAddr = $null
+          try {
+            $zip = Join-Path $env:TEMP 'bore.zip'
+            Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-pc-windows-msvc.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 120
+            Expand-Archive -Path $zip -DestinationPath (Join-Path $env:TEMP 'bore') -Force
+            $be = Join-Path $env:TEMP 'bore.bore.err'
+            Start-Process -FilePath (Join-Path $env:TEMP 'bore\bore.exe') -ArgumentList 'local','3389','--to','bore.pub' -RedirectStandardError $be -RedirectStandardOutput (Join-Path $env:TEMP 'bore.bore.out') -NoNewWindow
+            Start-Sleep -Seconds 20
+            $bt = (Get-Content $be -Raw -ErrorAction SilentlyContinue)
+            Write-Output $bt
+            $m = [regex]::Match([string]$bt, 'bore\.pub:(\d+)')
+            if ($m.Success) { $boreAddr = 'bore.pub:' + $m.Groups[1].Value }
+          } catch { Write-Output ('bore 失败: ' + $_) }
+          Write-Output ('bore 地址 = ' + $boreAddr)
 
-          $sshUrl = $null
-          $webUrl = $null
-          for ($i = 0; $i -lt 40; $i++) {
-            Start-Sleep -Seconds 3
-            if (-not (Test-Path $log)) { continue }
-            $t = Get-Content $log -Raw -ErrorAction SilentlyContinue
-            if (-not $t) { continue }
-            $m1 = [regex]::Match($t, 'ssh\s+([A-Za-z0-9]+@[A-Za-z0-9.\-]*tmate[A-Za-z0-9.\-]*)')
-            $m2 = [regex]::Match($t, 'https?://tmate\.io/t/[A-Za-z0-9]+')
-            if ($m1.Success) { $sshUrl = $m1.Groups[1].Value }
-            if ($m2.Success) { $webUrl = $m2.Value }
-            if ($sshUrl) { break }
-          }
+          Write-Output '=== 3. serveo 隧道 ==='
+          $srvAddr = $null
+          try {
+            $se = Join-Path $env:TEMP 'serveo.err'
+            Start-Process -FilePath 'ssh.exe' -ArgumentList '-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','ServerAliveInterval=30','-R','0:localhost:3389','serveo.net' -RedirectStandardError $se -RedirectStandardOutput (Join-Path $env:TEMP 'serveo.out') -NoNewWindow
+            Start-Sleep -Seconds 25
+            $st = (Get-Content $se -Raw -ErrorAction SilentlyContinue)
+            Write-Output $st
+            $m2 = [regex]::Match([string]$st, 'serveo\.net:(\d+)')
+            if ($m2.Success) { $srvAddr = 'serveo.net:' + $m2.Groups[1].Value }
+          } catch { Write-Output ('serveo 失败: ' + $_) }
+          Write-Output ('serveo 地址 = ' + $srvAddr)
 
-          Write-Output '--- tmate 输出 ---'
-          Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { Write-Output $_ }
-          Write-Output '--- 解析结果 ---'
-          Write-Output "SSH=$sshUrl"
-          Write-Output "WEB=$webUrl"
-
-          if ($sshUrl) { Write-Output "::notice title=SSH::$sshUrl" }
-          if ($webUrl) { Write-Output "::notice title=Web::$webUrl" }
-
+          Write-Output '=== 4. 回写 status.md ==='
           $lines = @(
             '# Windows 白嫖机',
             '',
-            '- SSH: ' + $sshUrl,
-            '- Web: ' + $webUrl,
-            '- OS: ' + (Get-CimInstance Win32_OperatingSystem).Caption,
+            '- 用户名: .\runneradmin',
+            '- 密码: ' + $pw,
+            '- RDP 地址 A (bore): ' + $boreAddr,
+            '- RDP 地址 B (serveo): ' + $srvAddr,
+            '- 系统: ' + (Get-CimInstance Win32_OperatingSystem).Caption,
             '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
           )
           $body = $lines -join "`n"
@@ -83,9 +89,9 @@ jobs:
           $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
           try {
             $ex = Invoke-RestMethod -Uri $api -Headers $h -ErrorAction Stop
-            $payload = @{ message = 'ci: 连接信息'; content = $b64; sha = $ex.sha; branch = 'main' } | ConvertTo-Json -Compress
+            $payload = @{ message = 'ci: RDP 地址'; content = $b64; sha = $ex.sha; branch = 'main' } | ConvertTo-Json -Compress
           } catch {
-            $payload = @{ message = 'ci: 连接信息'; content = $b64; branch = 'main' } | ConvertTo-Json -Compress
+            $payload = @{ message = 'ci: RDP 地址'; content = $b64; branch = 'main' } | ConvertTo-Json -Compress
           }
           try {
             Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $payload -ContentType 'application/json; charset=utf-8' | Out-Null
@@ -94,7 +100,10 @@ jobs:
             Write-Output ('回写失败: ' + $_)
           }
 
-          Write-Output '--- 会话保持中，最长 350 分钟 ---'
+          if ($boreAddr) { Write-Output ('::notice title=RDP-bore::mstsc /v:' + $boreAddr) }
+          if ($srvAddr)  { Write-Output ('::notice title=RDP-serveo::mstsc /v:' + $srvAddr) }
+
+          Write-Output '=== 5. 保持会话 ==='
           while ($true) {
             Start-Sleep -Seconds 120
             Write-Output ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss'))
