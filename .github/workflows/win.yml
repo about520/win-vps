@@ -51,10 +51,12 @@ jobs:
             $be = Join-Path $env:TEMP 'bore.bore.err'
             Start-Process -FilePath (Join-Path $env:TEMP 'bore\bore.exe') -ArgumentList 'local','3389','--to','bore.pub' -RedirectStandardError $be -RedirectStandardOutput (Join-Path $env:TEMP 'bore.bore.out') -NoNewWindow
             Start-Sleep -Seconds 20
-            $bt = (Get-Content $be -Raw -ErrorAction SilentlyContinue)
-            Write-Output $bt
-            $m = [regex]::Match([string]$bt, 'bore\.pub:(\d+)')
-            if ($m.Success) { $boreAddr = 'bore.pub:' + $m.Groups[1].Value }
+            $bt = [string](Get-Content $be -Raw -ErrorAction SilentlyContinue)
+            Write-Output ('bore 原始输出: ' + $bt)
+            if ($bt) {
+              $m = [regex]::Match($bt, 'bore\.pub:(\d+)')
+              if ($m.Success) { $boreAddr = 'bore.pub:' + $m.Groups[1].Value }
+            }
           } catch { Write-Output ('bore 失败: ' + $_) }
           Write-Output ('bore 地址 = ' + $boreAddr)
 
@@ -64,12 +66,28 @@ jobs:
             $se = Join-Path $env:TEMP 'serveo.err'
             Start-Process -FilePath 'ssh.exe' -ArgumentList '-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','ServerAliveInterval=30','-R','0:localhost:3389','serveo.net' -RedirectStandardError $se -RedirectStandardOutput (Join-Path $env:TEMP 'serveo.out') -NoNewWindow
             Start-Sleep -Seconds 25
-            $st = (Get-Content $se -Raw -ErrorAction SilentlyContinue)
-            Write-Output $st
-            $m2 = [regex]::Match([string]$st, 'serveo\.net:(\d+)')
-            if ($m2.Success) { $srvAddr = 'serveo.net:' + $m2.Groups[1].Value }
+            $st = [string](Get-Content $se -Raw -ErrorAction SilentlyContinue)
+            Write-Output ('serveo 原始输出: ' + $st)
+            if ($st) {
+              $m2 = [regex]::Match($st, 'Allocated port (\d+)')
+              if (-not $m2.Success) { $m2 = [regex]::Match($st, 'serveo\.net:(\d+)') }
+              if ($m2.Success) { $srvAddr = 'serveo.net:' + $m2.Groups[1].Value }
+            }
           } catch { Write-Output ('serveo 失败: ' + $_) }
           Write-Output ('serveo 地址 = ' + $srvAddr)
+
+          Write-Output '=== 3b. pinggy 隧道 ==='
+          $pgAddr = $null
+          try {
+            $pe = Join-Path $env:TEMP 'pinggy.err'
+            Start-Process -FilePath 'ssh.exe' -ArgumentList '-p','443','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','ServerAliveInterval=30','-R0:localhost:3389','a.pinggy.io' -RedirectStandardError $pe -RedirectStandardOutput (Join-Path $env:TEMP 'pinggy.out') -NoNewWindow
+            Start-Sleep -Seconds 25
+            $pt = [string]((Get-Content $pe -Raw -ErrorAction SilentlyContinue) + (Get-Content (Join-Path $env:TEMP 'pinggy.out') -Raw -ErrorAction SilentlyContinue))
+            Write-Output ('pinggy 原始输出: ' + $pt)
+            $m3 = [regex]::Match($pt, '(?:pinggy\.link|pinggy\.io):(\d+)')
+            if ($m3.Success) { $pgAddr = 'pinggy: ' + $m3.Value }
+          } catch { Write-Output ('pinggy 失败: ' + $_) }
+          Write-Output ('pinggy 地址 = ' + $pgAddr)
 
           Write-Output '=== 4. 回写 status.md ==='
           $lines = @(
@@ -79,6 +97,7 @@ jobs:
             '- 密码: ' + $pw,
             '- RDP 地址 A (bore): ' + $boreAddr,
             '- RDP 地址 B (serveo): ' + $srvAddr,
+            '- RDP 地址 C (pinggy): ' + $pgAddr,
             '- 系统: ' + (Get-CimInstance Win32_OperatingSystem).Caption,
             '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
           )
