@@ -1,7 +1,7 @@
 # Windows 白嫖机
 
 - RDP 地址: 
-bore.pub:10285
+bore.pub:27287
 - 用户名: 
 runnervmm7ud1
 \runneradmin
@@ -14,5 +14,5 @@ Runner2024
 - RDP 服务: 
 Running
 - 时间: 
-2026-11-20 09:37:22
+2026-11-20 09:43:28
  UTC
