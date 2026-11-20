@@ -60,13 +60,28 @@ jobs:
           $after = Get-LocalUser -Name 'runneradmin'
           Write-Host ('Enabled=' + $after.Enabled + ' PwExpires=' + $after.PasswordExpires)
 
-          Write-Host '=== 4. 开远程桌面 ==='
+          Write-Host '=== 4. 开远程桌面（适配 TCP 隧道）==='
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          $rdp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          Set-ItemProperty -Path $rdp -Name 'UserAuthentication' -Value 0
+          # 关键：隧道只能走 TCP，必须关掉 RDP 的 UDP 传输，否则 mstsc 卡死
+          $tsPol = 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $tsPol -Force | Out-Null
+          New-ItemProperty -Path $tsPol -Name 'fDisableUdp' -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $tsPol -Name 'SelectTransport' -PropertyType DWord -Value 1 -Force | Out-Null
+          # 安全层降到 RDP 标准加密（不用 TLS），中继上兼容性最好
+          Set-ItemProperty -Path $rdp -Name 'SecurityLayer' -Value 0
+          Set-ItemProperty -Path $rdp -Name 'MinEncryptionLevel' -Value 1
+          Set-ItemProperty -Path $rdp -Name 'PortNumber' -Value 3389
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
           Set-Service -Name TermService -StartupType Automatic
           Start-Service TermService -ErrorAction SilentlyContinue
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 4
           $ts = (Get-Service TermService).Status
+          Write-Host ('UDP 已关闭: fDisableUdp=' + (Get-ItemProperty -Path $tsPol -Name 'fDisableUdp' -ErrorAction SilentlyContinue).fDisableUdp)
+          Write-Host ('SecurityLayer=' + (Get-ItemProperty -Path $rdp -Name 'SecurityLayer' -ErrorAction SilentlyContinue).SecurityLayer)
+          Write-Host ('端口=' + (Get-ItemProperty -Path $rdp -Name 'PortNumber' -ErrorAction SilentlyContinue).PortNumber)
           Write-Host ('TermService = ' + $ts)
           $hostname = $env:COMPUTERNAME
           Write-Host ('主机名 = ' + $hostname)
@@ -89,7 +104,7 @@ jobs:
               '- 密码: ' + $pw,
               '- 密码是否实测通过: ' + $(if ($pw) { '是' } else { '否' }),
               '- 系统: Windows Server 2025 Datacenter',
-              '- RDP 服务: ' + $ts,
+              '- RDP 服务: ' + $ts + ' (TCP only)',
               '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
             )
             $body = $lines -join "`n"
