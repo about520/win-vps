@@ -1,0 +1,109 @@
+name: win-vps
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "最长在线分钟数 (上限 350)"
+        required: true
+        default: "350"
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: win-vps
+  cancel-in-progress: false
+
+jobs:
+  win:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 机器信息
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | Format-List
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List
+          Get-PSDrive C | Select-Object Used,Free | Format-List
+          Write-Output "runner=${{ runner.name }} os=${{ runner.os }} arch=${{ runner.arch }}"
+
+      - name: 起网页终端并回写地址
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = "$env:TEMP\sshx.out"
+          $err = "$env:TEMP\sshx.err"
+          Remove-Item $log,$err -ErrorAction SilentlyContinue
+
+          Start-Process -FilePath "bash" `
+            -ArgumentList '-lc','curl -sSf https://sshx.io/get | sh -s run' `
+            -RedirectStandardOutput $log -RedirectStandardError $err -NoNewWindow
+
+          $url = $null
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 5
+            $txt = ''
+            if (Test-Path $log) { $txt += (Get-Content $log -Raw -ErrorAction SilentlyContinue) }
+            if (Test-Path $err) { $txt += (Get-Content $err -Raw -ErrorAction SilentlyContinue) }
+            $m = [regex]::Match($txt, 'https://sshx\.io/s/[A-Za-z0-9]+')
+            if ($m.Success) { $url = $m.Value; break }
+          }
+
+          $info = New-Object System.Collections.ArrayList
+          [void]$info.Add('# Windows 白嫖机')
+          [void]$info.Add('')
+          [void]$info.Add('## 机器')
+          [void]$info.Add('')
+          [void]$info.Add('- OS: ')
+          [void]$info.Add('```')
+          [void]$info.Add((Get-CimInstance Win32_OperatingSystem).Caption)
+          [void]$info.Add('```')
+          [void]$info.Add('')
+          if ($url) {
+            [void]$info.Add('## 网页终端 (浏览器直接打开)')
+            [void]$info.Add('')
+            [void]$info.Add('```')
+            [void]$info.Add($url)
+            [void]$info.Add('```')
+          } else {
+            [void]$info.Add('## sshx 没起来')
+            [void]$info.Add('')
+            [void]$info.Add('看 tmate 步骤日志')
+            if (Test-Path $err) {
+              [void]$info.Add('```')
+              [void]$info.Add((Get-Content $err -Raw -ErrorAction SilentlyContinue))
+              [void]$info.Add('```')
+            }
+          }
+          [void]$info.Add('')
+          [void]$info.Add('更新时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC')
+          $body = $info -join "`n"
+          Write-Output $body
+
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/contents/status.md"
+          $h = @{ Authorization = "token $env:GITHUB_TOKEN"; "User-Agent" = "gh-actions"; Accept = "application/vnd.github+json" }
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+          try {
+            $ex = Invoke-RestMethod -Uri $api -Headers $h -ErrorAction Stop
+            $payload = @{ message = "ci: 更新连接信息"; content = $b64; sha = $ex.sha; branch = "main" } | ConvertTo-Json -Compress
+          } catch {
+            $payload = @{ message = "ci: 更新连接信息"; content = $b64; branch = "main" } | ConvertTo-Json -Compress
+          }
+          try {
+            Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $payload -ContentType "application/json; charset=utf-8" | Out-Null
+            Write-Output "status.md 已回写"
+          } catch {
+            Write-Output "回写失败: $_"
+          }
+
+      - name: tmate 命令行 (SSH)
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 350
+        with:
+          limit-access-to-actor: false
