@@ -22,9 +22,8 @@ jobs:
         run: |
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,TotalVisibleMemorySize | Format-List
           Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List
-          Get-PSDrive C | Select-Object Used,Free | Format-List
 
-      - name: 开 RDP + 双隧道并回写地址
+      - name: 开 RDP + bore 隧道（自动重连）
         shell: pwsh
         timeout-minutes: 350
         env:
@@ -33,97 +32,92 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $pw = 'GitHub@2024!vps'
 
-          Write-Output '=== 1. 设置账户与远程桌面 ==='
-          net user runneradmin $pw 2>&1 | Out-String | Write-Output
+          Write-Host '=== 1. 账户与远程桌面 ==='
+          net user runneradmin $pw 2>&1 | Out-String | Write-Host
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
           Set-Service -Name TermService -StartupType Automatic
           Start-Service TermService -ErrorAction SilentlyContinue
-          Get-Service TermService | Select-Object Name,Status | Format-List
+          Write-Host ('TermService = ' + (Get-Service TermService).Status)
 
-          Write-Output '=== 2. bore 隧道 ==='
-          $boreAddr = $null
-          try {
-            $zip = Join-Path $env:TEMP 'bore.zip'
-            Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-pc-windows-msvc.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 120
-            Expand-Archive -Path $zip -DestinationPath (Join-Path $env:TEMP 'bore') -Force
-            $be = Join-Path $env:TEMP 'bore.bore.err'
-            Start-Process -FilePath (Join-Path $env:TEMP 'bore\bore.exe') -ArgumentList 'local','3389','--to','bore.pub' -RedirectStandardError $be -RedirectStandardOutput (Join-Path $env:TEMP 'bore.bore.out') -NoNewWindow
-            Start-Sleep -Seconds 20
-            $bt = [string](Get-Content $be -Raw -ErrorAction SilentlyContinue)
-            Write-Output ('bore 原始输出: ' + $bt)
-            if ($bt) {
-              $m = [regex]::Match($bt, 'bore\.pub:(\d+)')
-              if ($m.Success) { $boreAddr = 'bore.pub:' + $m.Groups[1].Value }
+          Write-Host '=== 2. 下载 bore ==='
+          $dir = Join-Path $env:TEMP 'bore'
+          $zip = Join-Path $env:TEMP 'bore.zip'
+          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.3/bore-v0.5.3-x86_64-pc-windows-msvc.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 180
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $boreExe = (Get-ChildItem -Path $dir -Recurse -Filter 'bore.exe' | Select-Object -First 1).FullName
+          Write-Host ('bore.exe = ' + $boreExe)
+          if (-not $boreExe) { throw 'bore.exe 没找到' }
+
+          function Push-Status([string]$addr) {
+            $lines = @(
+              '# Windows 白嫖机',
+              '',
+              '- RDP 地址: ' + $addr,
+              '- 用户名: .\runneradmin',
+              '- 密码: ' + $pw,
+              '- 系统: Windows Server 2025 Datacenter',
+              '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+            )
+            $body = $lines -join "`n"
+            $api = 'https://api.github.com/repos/' + $env:GITHUB_REPOSITORY + '/contents/status.md'
+            $h = @{ Authorization = 'token ' + $env:GH_TOKEN; 'User-Agent' = 'gh'; Accept = 'application/vnd.github+json' }
+            $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+            try {
+              $ex = Invoke-RestMethod -Uri $api -Headers $h -ErrorAction Stop
+              $p = @{ message = 'ci: rdp'; content = $b64; sha = $ex.sha; branch = 'main' } | ConvertTo-Json -Compress
+            } catch {
+              $p = @{ message = 'ci: rdp'; content = $b64; branch = 'main' } | ConvertTo-Json -Compress
             }
-          } catch { Write-Output ('bore 失败: ' + $_) }
-          Write-Output ('bore 地址 = ' + $boreAddr)
-
-          Write-Output '=== 3. serveo 隧道 ==='
-          $srvAddr = $null
-          try {
-            $se = Join-Path $env:TEMP 'serveo.err'
-            Start-Process -FilePath 'ssh.exe' -ArgumentList '-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','ServerAliveInterval=30','-R','0:localhost:3389','serveo.net' -RedirectStandardError $se -RedirectStandardOutput (Join-Path $env:TEMP 'serveo.out') -NoNewWindow
-            Start-Sleep -Seconds 25
-            $st = [string](Get-Content $se -Raw -ErrorAction SilentlyContinue)
-            Write-Output ('serveo 原始输出: ' + $st)
-            if ($st) {
-              $m2 = [regex]::Match($st, 'Allocated port (\d+)')
-              if (-not $m2.Success) { $m2 = [regex]::Match($st, 'serveo\.net:(\d+)') }
-              if ($m2.Success) { $srvAddr = 'serveo.net:' + $m2.Groups[1].Value }
+            try {
+              Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $p -ContentType 'application/json; charset=utf-8' | Out-Null
+              Write-Host ('status.md <- ' + $addr)
+            } catch {
+              Write-Host ('回写失败: ' + $_)
             }
-          } catch { Write-Output ('serveo 失败: ' + $_) }
-          Write-Output ('serveo 地址 = ' + $srvAddr)
-
-          Write-Output '=== 3b. pinggy 隧道 ==='
-          $pgAddr = $null
-          try {
-            $pe = Join-Path $env:TEMP 'pinggy.err'
-            Start-Process -FilePath 'ssh.exe' -ArgumentList '-p','443','-o','StrictHostKeyChecking=no','-o','UserKnownHostsFile=NUL','-o','ServerAliveInterval=30','-R0:localhost:3389','a.pinggy.io' -RedirectStandardError $pe -RedirectStandardOutput (Join-Path $env:TEMP 'pinggy.out') -NoNewWindow
-            Start-Sleep -Seconds 25
-            $pt = [string]((Get-Content $pe -Raw -ErrorAction SilentlyContinue) + (Get-Content (Join-Path $env:TEMP 'pinggy.out') -Raw -ErrorAction SilentlyContinue))
-            Write-Output ('pinggy 原始输出: ' + $pt)
-            $m3 = [regex]::Match($pt, '(?:pinggy\.link|pinggy\.io):(\d+)')
-            if ($m3.Success) { $pgAddr = 'pinggy: ' + $m3.Value }
-          } catch { Write-Output ('pinggy 失败: ' + $_) }
-          Write-Output ('pinggy 地址 = ' + $pgAddr)
-
-          Write-Output '=== 4. 回写 status.md ==='
-          $lines = @(
-            '# Windows 白嫖机',
-            '',
-            '- 用户名: .\runneradmin',
-            '- 密码: ' + $pw,
-            '- RDP 地址 A (bore): ' + $boreAddr,
-            '- RDP 地址 B (serveo): ' + $srvAddr,
-            '- RDP 地址 C (pinggy): ' + $pgAddr,
-            '- 系统: ' + (Get-CimInstance Win32_OperatingSystem).Caption,
-            '- 时间: ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
-          )
-          $body = $lines -join "`n"
-
-          $api = 'https://api.github.com/repos/' + $env:GITHUB_REPOSITORY + '/contents/status.md'
-          $h = @{ Authorization = 'token ' + $env:GH_TOKEN; 'User-Agent' = 'gh-actions'; Accept = 'application/vnd.github+json' }
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
-          try {
-            $ex = Invoke-RestMethod -Uri $api -Headers $h -ErrorAction Stop
-            $payload = @{ message = 'ci: RDP 地址'; content = $b64; sha = $ex.sha; branch = 'main' } | ConvertTo-Json -Compress
-          } catch {
-            $payload = @{ message = 'ci: RDP 地址'; content = $b64; branch = 'main' } | ConvertTo-Json -Compress
-          }
-          try {
-            Invoke-RestMethod -Uri $api -Method Put -Headers $h -Body $payload -ContentType 'application/json; charset=utf-8' | Out-Null
-            Write-Output 'status.md 已回写'
-          } catch {
-            Write-Output ('回写失败: ' + $_)
           }
 
-          if ($boreAddr) { Write-Output ('::notice title=RDP-bore::mstsc /v:' + $boreAddr) }
-          if ($srvAddr)  { Write-Output ('::notice title=RDP-serveo::mstsc /v:' + $srvAddr) }
+          function Start-Bore {
+            Get-Process bore -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            $o = Join-Path $env:TEMP 'bore.out'
+            $e = Join-Path $env:TEMP 'bore.err'
+            Remove-Item $o,$e -ErrorAction SilentlyContinue
+            Start-Process -FilePath $boreExe -ArgumentList 'local','3389','--to','bore.pub' -RedirectStandardOutput $o -RedirectStandardError $e -NoNewWindow
+            $addr = ''
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Seconds 3
+              $t = [string](Get-Content $o -Raw -ErrorAction SilentlyContinue) + [string](Get-Content $e -Raw -ErrorAction SilentlyContinue)
+              $m = [regex]::Match($t, 'listening at bore\.pub:(\d+)')
+              if ($m.Success) { $addr = 'bore.pub:' + $m.Groups[1].Value; break }
+            }
+            if (-not $addr) {
+              Write-Host ('bore 原始输出: ' + [string](Get-Content $e -Raw -ErrorAction SilentlyContinue))
+            }
+            Write-Host ('Start-Bore 结果 = ' + $addr)
+            return $addr
+          }
 
-          Write-Output '=== 5. 保持会话 ==='
+          Write-Host '=== 3. 建立隧道 ==='
+          $addr = (Start-Bore | Select-Object -Last 1)
+          $last = $addr
+          if ($addr) {
+            Push-Status $addr
+            Write-Output ('::notice title=RDP::mstsc /v:' + $addr)
+          }
+
+          Write-Host '=== 4. 保活 + 断线重连 ==='
           while ($true) {
-            Start-Sleep -Seconds 120
-            Write-Output ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss'))
+            Start-Sleep -Seconds 60
+            $proc = Get-Process bore -ErrorAction SilentlyContinue
+            if (-not $proc) {
+              Write-Host 'bore 进程消失，重连中...'
+              $addr = (Start-Bore | Select-Object -Last 1)
+              if ($addr -and $addr -ne $last) {
+                $last = $addr
+                Push-Status $addr
+                Write-Output ('::notice title=RDP::mstsc /v:' + $addr)
+              }
+            }
+            Write-Host ('alive ' + (Get-Date).ToUniversalTime().ToString('HH:mm:ss') + '  addr=' + $last)
           }
